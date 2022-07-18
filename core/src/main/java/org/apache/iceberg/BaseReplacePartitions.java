@@ -57,6 +57,12 @@ public class BaseReplacePartitions
   }
 
   @Override
+  public ReplacePartitions addDropPartitionTuple(int specId, StructLike partition) {
+    dropPartition(specId, partition);
+    return this;
+  }
+
+  @Override
   public ReplacePartitions validateAppendOnly() {
     failAnyDelete();
     return this;

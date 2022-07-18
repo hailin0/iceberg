@@ -50,6 +50,15 @@ public interface ReplacePartitions extends SnapshotUpdate<ReplacePartitions> {
   ReplacePartitions addFile(DataFile file);
 
   /**
+   * Add a partition tuple to drop from the table during the delete phase.
+   *
+   * @param specId partition spec id
+   * @param partition file partition
+   * @return this for method chaining
+   */
+  ReplacePartitions addDropPartitionTuple(int specId, StructLike partition);
+
+  /**
    * Validate that no partitions will be replaced and the operation is append-only.
    *
    * @return this for method chaining

@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import org.apache.flink.api.common.functions.FilterFunction;
 import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
@@ -47,17 +48,23 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SerializableTable;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.expressions.Evaluator;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.FlinkWriteOptions;
+import org.apache.iceberg.flink.RowDataWrapper;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.base.Strings;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.transforms.Transform;
 import org.apache.iceberg.types.TypeUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -122,6 +129,7 @@ public class FlinkSink {
     private Function<String, DataStream<RowData>> inputCreator = null;
     private TableLoader tableLoader;
     private Table table;
+    private Map<String, String> tableProps;
     private TableSchema tableSchema;
     private Integer writeParallelism = null;
     private List<String> equalityFieldColumns = null;
@@ -196,6 +204,11 @@ public class FlinkSink {
      */
     public Builder setAll(Map<String, String> properties) {
       writeOptions.putAll(properties);
+      return this;
+    }
+
+    public Builder tableProps(Map<String, String> tableProps) {
+      this.tableProps = tableProps;
       return this;
     }
 
@@ -326,6 +339,10 @@ public class FlinkSink {
       // Convert the requested flink table schema to flink row type.
       RowType flinkRowType = toFlinkRowType(table.schema(), tableSchema);
 
+      // Filter rowTime by expression
+      Expression rowTimeFilter = buildRowTimeFilter(table.schema(), table.spec(), tableProps);
+      rowDataInput = appendDataStreamFilter(table.schema(), flinkRowType, rowDataInput, rowTimeFilter);
+
       // Distribute the records from input data stream based on the write.distribution-mode and equality fields.
       DataStream<RowData> distributeStream = distributeDataStream(
           rowDataInput, equalityFieldIds, table.spec(), table.schema(), flinkRowType);
@@ -336,7 +353,9 @@ public class FlinkSink {
 
       // Add single-parallelism committer that commits files
       // after successful checkpoint or end of input
-      SingleOutputStreamOperator<Void> committerStream = appendCommitter(writerStream);
+      Expression replacePartitionExpression = flinkWriteConf.overwriteMode() ?
+          buildReplacePartitionExpression(rowTimeFilter, tableProps) : null;
+      SingleOutputStreamOperator<Void> committerStream = appendCommitter(writerStream, replacePartitionExpression);
 
       // Add dummy discard sink
       return appendDummySink(committerStream);
@@ -389,10 +408,11 @@ public class FlinkSink {
       return resultStream;
     }
 
-    private SingleOutputStreamOperator<Void> appendCommitter(SingleOutputStreamOperator<WriteResult> writerStream) {
+    private SingleOutputStreamOperator<Void> appendCommitter(SingleOutputStreamOperator<WriteResult> writerStream,
+                                                             Expression replacePartitionExpression) {
       IcebergFilesCommitter filesCommitter = new IcebergFilesCommitter(
-          tableLoader, flinkWriteConf.overwriteMode(), snapshotProperties,
-          flinkWriteConf.workerPoolSize());
+          tableLoader, flinkWriteConf.overwriteMode(), replacePartitionExpression,
+          snapshotProperties, flinkWriteConf.workerPoolSize());
       SingleOutputStreamOperator<Void> committerStream = writerStream
           .transform(operatorName(ICEBERG_FILES_COMMITTER_NAME), Types.VOID, filesCommitter)
           .setParallelism(1)
@@ -431,6 +451,23 @@ public class FlinkSink {
         writerStream = writerStream.uid(uidPrefix + "-writer");
       }
       return writerStream;
+    }
+
+    private DataStream<RowData> appendDataStreamFilter(Schema schema,
+                                                       RowType rowType,
+                                                       DataStream<RowData> inputStream,
+                                                       Expression rowTimeFilter) {
+      if (rowTimeFilter == null) {
+        return inputStream;
+      }
+
+      Evaluator rowDataEvaluator = new Evaluator(schema.asStruct(), rowTimeFilter);
+      FilterFunction<RowData> filter = rowData -> {
+        RowDataWrapper rowDataWrapper = new RowDataWrapper(rowType, schema.asStruct());
+        rowDataWrapper.wrap(rowData);
+        return rowDataEvaluator.eval(rowDataWrapper);
+      };
+      return inputStream.filter(filter);
     }
 
     private DataStream<RowData> distributeDataStream(DataStream<RowData> input,
@@ -518,5 +555,52 @@ public class FlinkSink {
         serializableTable, flinkRowType, flinkWriteConf.targetDataFileSize(),
         flinkWriteConf.dataFileFormat(), equalityFieldIds, flinkWriteConf.upsertMode());
     return new IcebergStreamWriter<>(table.name(), taskWriterFactory);
+  }
+
+  private static Expression buildReplacePartitionExpression(Expression rowTimeFilter, Map<String, String> tableProps) {
+    return rowTimeFilter == null ? Expressions.alwaysTrue() : rowTimeFilter;
+  }
+
+  private static Expression buildRowTimeFilter(Schema schema, PartitionSpec partitionSpec, Map<String, String> tableProps) {
+    String startRowTimeStr = tableProps.get("sink.startRowTime");
+    String endRowTimeStr = tableProps.get("sink.endRowTime");
+    Long startRowTime = Strings.isNullOrEmpty(startRowTimeStr) ? null : Long.parseLong(startRowTimeStr);
+    Long endRowTime = Strings.isNullOrEmpty(endRowTimeStr) ? null : Long.parseLong(endRowTimeStr);
+    if (startRowTime == null && endRowTime == null) {
+      return null;
+    }
+    if (startRowTime != null && endRowTime != null && endRowTime <= startRowTime) {
+      throw new IllegalArgumentException(
+              "endRowTime must be greater than startRowTime: [" + startRowTime + "," + endRowTime + "]");
+    }
+
+    List<PartitionField> partitionFields = partitionSpec.fields();
+    if (partitionFields.size() > 1) {
+      throw new IllegalArgumentException("More than one partition fields: " + partitionFields);
+    }
+
+    Expression rowTimeFilter = Expressions.alwaysTrue();
+    PartitionField rowTimePartitionField = partitionFields.stream().findFirst().get();
+    String rowTimeColumnName = schema.findColumnName(rowTimePartitionField.sourceId());
+    if (startRowTime != null) {
+      validateRowTime(startRowTime, rowTimePartitionField);
+      rowTimeFilter = Expressions.and(rowTimeFilter,
+              Expressions.greaterThanOrEqual(rowTimeColumnName, startRowTime));
+    }
+    if (endRowTime != null) {
+      validateRowTime(endRowTime, rowTimePartitionField);
+      rowTimeFilter = Expressions.and(rowTimeFilter,
+              Expressions.lessThan(rowTimeColumnName, endRowTime));
+    }
+    return rowTimeFilter;
+  }
+
+  private static void validateRowTime(Long rowTime, PartitionField rowTimePartitionField) throws IllegalArgumentException {
+    Transform<Long, Integer> timestampTransform = (Transform<Long, Integer>) rowTimePartitionField.transform();
+    Integer currentPartition = timestampTransform.apply(rowTime);
+    Integer prevPartition = timestampTransform.apply(rowTime - 1);
+    if (currentPartition.equals(prevPartition)) {
+      throw new IllegalArgumentException("The rowTime is not the start point of a timestamp partition: " + rowTime);
+    }
   }
 }

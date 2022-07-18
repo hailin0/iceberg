@@ -36,6 +36,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 
 public class IcebergTableSink implements DynamicTableSink, SupportsPartitioning, SupportsOverwrite {
   private final TableLoader tableLoader;
+  private final Map<String, String> tableProps;
   private final TableSchema tableSchema;
   private final ReadableConfig readableConfig;
 
@@ -43,13 +44,15 @@ public class IcebergTableSink implements DynamicTableSink, SupportsPartitioning,
 
   private IcebergTableSink(IcebergTableSink toCopy) {
     this.tableLoader = toCopy.tableLoader;
+    this.tableProps = toCopy.tableProps;
     this.tableSchema = toCopy.tableSchema;
     this.overwrite = toCopy.overwrite;
     this.readableConfig = toCopy.readableConfig;
   }
 
-  public IcebergTableSink(TableLoader tableLoader, TableSchema tableSchema, ReadableConfig readableConfig) {
+  public IcebergTableSink(TableLoader tableLoader, Map<String, String> tableProps, TableSchema tableSchema, ReadableConfig readableConfig) {
     this.tableLoader = tableLoader;
+    this.tableProps = tableProps;
     this.tableSchema = tableSchema;
     this.readableConfig = readableConfig;
   }
@@ -65,6 +68,7 @@ public class IcebergTableSink implements DynamicTableSink, SupportsPartitioning,
 
     return (DataStreamSinkProvider) (providerContext, dataStream) -> FlinkSink.forRowData(dataStream)
         .tableLoader(tableLoader)
+        .tableProps(tableProps)
         .tableSchema(tableSchema)
         .equalityFieldColumns(equalityColumns)
         .overwrite(overwrite)
