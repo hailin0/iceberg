@@ -40,13 +40,19 @@ import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.table.runtime.typeutils.SortedMapTypeInfo;
 import org.apache.iceberg.AppendFiles;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.ReplacePartitions;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -80,6 +86,7 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   // TableLoader to load iceberg table lazily.
   private final TableLoader tableLoader;
   private final boolean replacePartitions;
+  private final Expression replacePartitionExpression;
   private final Map<String, String> snapshotProperties;
 
   // A sorted map to maintain the completed data files for each pending checkpointId (which have not been committed
@@ -115,10 +122,12 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   private final Integer workerPoolSize;
   private transient ExecutorService workerPool;
 
-  IcebergFilesCommitter(TableLoader tableLoader, boolean replacePartitions, Map<String, String> snapshotProperties,
+  IcebergFilesCommitter(TableLoader tableLoader, boolean replacePartitions,
+                        Expression replacePartitionExpression, Map<String, String> snapshotProperties,
                         Integer workerPoolSize) {
     this.tableLoader = tableLoader;
     this.replacePartitions = replacePartitions;
+    this.replacePartitionExpression = replacePartitionExpression;
     this.snapshotProperties = snapshotProperties;
     this.workerPoolSize = workerPoolSize;
   }
@@ -250,13 +259,31 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
   }
 
   private void replacePartitions(NavigableMap<Long, WriteResult> pendingResults, String newFlinkJobId,
-                                 long checkpointId) {
+                                 long checkpointId) throws IOException {
     // Partition overwrite does not support delete files.
     int deleteFilesNum = pendingResults.values().stream().mapToInt(r -> r.deleteFiles().length).sum();
     Preconditions.checkState(deleteFilesNum == 0, "Cannot overwrite partitions with delete files.");
 
     // Commit the overwrite transaction.
     ReplacePartitions dynamicOverwrite = table.newReplacePartitions().scanManifestsWith(workerPool);
+    if (replacePartitionExpression != null) {
+      PartitionSpec tableSpec = table.spec();
+      try (CloseableIterable<FileScanTask> fileScanTasks = table.newScan()
+              .filter(replacePartitionExpression)
+              .planFiles()) {
+        for (FileScanTask fileScanTask : fileScanTasks) {
+          DataFile dataFile = fileScanTask.file();
+          if (!Expressions.alwaysTrue().equals(replacePartitionExpression)) {
+            PartitionSpec fileSpec = fileScanTask.spec();
+            if (!fileSpec.compatibleWith(tableSpec)) {
+              LOG.warn("Do not overwrite data file with different partition spec: {}", dataFile.path());
+              continue;
+            }
+          }
+          dynamicOverwrite.addDropPartitionTuple(dataFile.specId(), dataFile.partition());
+        }
+      }
+    }
 
     int numFiles = 0;
     for (WriteResult result : pendingResults.values()) {
